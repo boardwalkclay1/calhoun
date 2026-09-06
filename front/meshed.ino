@@ -7,18 +7,18 @@
 uint8_t clonedMac[6] = { 0x28, 0xDF, 0xEB, 0x06, 0xE6, 0x63 };
 
 // ================== WIFI SETTINGS ==================
-const char* apSSID     = "CalhounMeshNode";
+const char* apSSID     = "CalhounRepeater";
 const char* apPassword = "calhounpass";
 
 const char* staSSID    = "";
 const char* staPass    = "";
 
 // ================== GPIO LABELS ==================
-// Blind spot ultrasonic sensors
+// Blind spot ultrasonic sensors (left/right)
 #define PIN_ULTRA_LEFT       4
 #define PIN_ULTRA_RIGHT      5
 
-// Radar modules (front)
+// Front radar modules (same module family)
 #define PIN_RADAR_LEFT       6
 #define PIN_RADAR_CENTER     7
 #define PIN_RADAR_RIGHT      8
@@ -30,60 +30,42 @@ const char* staPass    = "";
 // Buzzer
 #define PIN_BUZZER           3
 
-// ================== MESH CONFIG ==================
-#define MAX_NODES 10
+// ================== ESP-NOW (MAIN CALHOUN DASHBOARD / CYD) ==================
+uint8_t masterMac[6] = { 0x24, 0x6F, 0x28, 0xAA, 0xBB, 0xCC }; // <-- PUT CYD ESP MAC HERE
 
-uint8_t meshNodes[MAX_NODES][6] = {
-  {0x24,0x6F,0x28,0xAA,0xBB,0xCC}, // CYD MASTER
-  {0x28,0xDF,0xEB,0x06,0xE6,0x63}, // Node 1 (your repeater)
-  {0x28,0xDF,0xEB,0x06,0xE6,0x64}, // Node 2
-  {0x28,0xDF,0xEB,0x06,0xE6,0x65}, // Node 3
-  {0x28,0xDF,0xEB,0x06,0xE6,0x66}, // Node 4
-};
-
-int nodeCount = 5;
-
-// ================== PACKET STRUCT ==================
 typedef struct {
-  uint8_t originMac[6];   // who created the packet
-  uint8_t eventType;      // sensor type
-  int32_t value;          // sensor value
-} MeshPacket;
+  uint8_t eventType;
+  int32_t value;
+} CalhounEvent;
 
-// ================== ESP-NOW CALLBACK ==================
+esp_now_peer_info_t peerInfo;
+
+// ================== WEB SERVER ==================
+WebServer server(80);
+
+// ================== STATE ==================
+int  frontDistanceCm = 0;
+bool leftBlindSpot   = false;
+bool rightBlindSpot  = false;
+
+bool radarLeft       = false;
+bool radarCenter     = false;
+bool radarRight      = false;
+
+bool alertsEnabled   = true;
+
+// ================== REAL ESP-NOW CALLBACK ==================
 void onEspNowSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   Serial.print("ESP-NOW send status: ");
   Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Fail");
 }
 
-// ================== RECEIVE CALLBACK ==================
-void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
-  if (len != sizeof(MeshPacket)) return;
-
-  MeshPacket pkt;
-  memcpy(&pkt, data, sizeof(pkt));
-
-  // Forward packet to all other nodes except origin
-  for (int i = 0; i < nodeCount; i++) {
-    if (memcmp(meshNodes[i], pkt.originMac, 6) != 0) {
-      esp_now_send(meshNodes[i], (uint8_t*)&pkt, sizeof(pkt));
-    }
-  }
-
-  Serial.println("Mesh packet forwarded.");
-}
-
-// ================== SEND PACKET ==================
-void meshSend(uint8_t eventType, int32_t value) {
-  MeshPacket pkt;
-
-  esp_wifi_get_mac(WIFI_IF_STA, pkt.originMac);
-  pkt.eventType = eventType;
-  pkt.value     = value;
-
-  for (int i = 0; i < nodeCount; i++) {
-    esp_now_send(meshNodes[i], (uint8_t*)&pkt, sizeof(pkt));
-  }
+// ================== ESP-NOW SEND ==================
+void sendEvent(uint8_t type, int32_t value) {
+  CalhounEvent evt;
+  evt.eventType = type;
+  evt.value     = value;
+  esp_now_send(masterMac, (uint8_t*)&evt, sizeof(evt));
 }
 
 // ================== SENSOR READS ==================
@@ -146,6 +128,36 @@ void progressiveDistanceBeep(int d) {
   }
 }
 
+// ================== CONTROL PAGE ==================
+String makeControlPage() {
+  String html = "<html><body>";
+  html += "<h1>Calhoun Repeater Front Module</h1>";
+
+  html += "<p><b>Front Distance:</b> " + String(frontDistanceCm) + " cm</p>";
+  html += "<p><b>Left Blind Spot:</b> " + String(leftBlindSpot ? "CAR" : "CLEAR") + "</p>";
+  html += "<p><b>Right Blind Spot:</b> " + String(rightBlindSpot ? "CAR" : "CLEAR") + "</p>";
+
+  html += "<p><b>Radar Left:</b> " + String(radarLeft ? "OBJECT" : "CLEAR") + "</p>";
+  html += "<p><b>Radar Center:</b> " + String(radarCenter ? "OBJECT" : "CLEAR") + "</p>";
+  html += "<p><b>Radar Right:</b> " + String(radarRight ? "OBJECT" : "CLEAR") + "</p>";
+
+  html += "<h2>Alerts</h2>";
+  html += "<p><a href='/toggleAlerts'>Toggle Alerts (Currently: " + String(alertsEnabled ? "ON" : "OFF") + ")</a></p>";
+
+  html += "</body></html>";
+  return html;
+}
+
+void handleRoot() {
+  server.send(200, "text/html", makeControlPage());
+}
+
+void handleToggleAlerts() {
+  alertsEnabled = !alertsEnabled;
+  if (!alertsEnabled) digitalWrite(PIN_BUZZER, LOW);
+  server.send(200, "text/html", makeControlPage());
+}
+
 // ================== WIFI SETUP ==================
 void setupWiFi() {
   esp_wifi_set_mac(WIFI_IF_STA, clonedMac);
@@ -167,15 +179,14 @@ void setupEspNow() {
   }
 
   esp_now_register_send_cb(onEspNowSent);
-  esp_now_register_recv_cb(onEspNowRecv);
 
-  for (int i = 0; i < nodeCount; i++) {
-    esp_now_peer_info_t peer;
-    memset(&peer, 0, sizeof(peer));
-    memcpy(peer.peer_addr, meshNodes[i], 6);
-    peer.channel = 0;
-    peer.encrypt = false;
-    esp_now_add_peer(&peer);
+  memset(&peerInfo, 0, sizeof(peerInfo));
+  memcpy(peerInfo.peer_addr, masterMac, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Failed to add ESP-NOW peer");
   }
 }
 
@@ -194,19 +205,25 @@ void setup() {
   pinMode(PIN_ULTRA_ECHO, INPUT);
 
   pinMode(PIN_BUZZER, OUTPUT);
-
   digitalWrite(PIN_BUZZER, LOW);
 
   setupWiFi();
   setupEspNow();
 
-  Serial.println("Calhoun Mesh Node Ready");
+  server.on("/", handleRoot);
+  server.on("/control", handleRoot);
+  server.on("/toggleAlerts", handleToggleAlerts);
+  server.begin();
+
+  Serial.println("Calhoun Repeater Front Module Ready");
 }
 
 // ================== LOOP ==================
 unsigned long lastSensorTime = 0;
 
 void loop() {
+  server.handleClient();
+
   unsigned long now = millis();
   if (now - lastSensorTime > 200) {
     lastSensorTime = now;
@@ -214,29 +231,34 @@ void loop() {
     // Front distance
     int d = readDistanceCm();
     if (d > 0) {
-      progressiveDistanceBeep(d);
-      meshSend(1, d);
+      frontDistanceCm = d;
+      if (alertsEnabled) progressiveDistanceBeep(d);
+      sendEvent(1, d);
     }
 
     // Blind spot ultrasonic
-    bool leftBlindSpot  = readDigital(PIN_ULTRA_LEFT);
-    bool rightBlindSpot = readDigital(PIN_ULTRA_RIGHT);
+    leftBlindSpot  = readDigital(PIN_ULTRA_LEFT);
+    rightBlindSpot = readDigital(PIN_ULTRA_RIGHT);
 
-    if (leftBlindSpot)  beepPattern(4, 60);
-    if (rightBlindSpot) beepPattern(2, 60);
+    if (alertsEnabled) {
+      if (leftBlindSpot)  beepPattern(4, 60);  // LEFT = 4 beeps
+      if (rightBlindSpot) beepPattern(2, 60);  // RIGHT = 2 beeps
+    }
 
-    meshSend(2, leftBlindSpot  ? 1 : 0);
-    meshSend(3, rightBlindSpot ? 1 : 0);
+    sendEvent(2, leftBlindSpot  ? 1 : 0);
+    sendEvent(3, rightBlindSpot ? 1 : 0);
 
-    // Radar modules
-    bool radarLeft   = readDigital(PIN_RADAR_LEFT);
-    bool radarCenter = readDigital(PIN_RADAR_CENTER);
-    bool radarRight  = readDigital(PIN_RADAR_RIGHT);
+    // Radar modules (front)
+    radarLeft   = readDigital(PIN_RADAR_LEFT);
+    radarCenter = readDigital(PIN_RADAR_CENTER);
+    radarRight  = readDigital(PIN_RADAR_RIGHT);
 
-    if (radarCenter) beepPattern(1, 80);
+    if (alertsEnabled && radarCenter) {
+      beepPattern(1, 80);  // FRONT = 1 beep
+    }
 
-    meshSend(4, radarLeft   ? 1 : 0);
-    meshSend(5, radarCenter ? 1 : 0);
-    meshSend(6, radarRight  ? 1 : 0);
+    sendEvent(4, radarLeft   ? 1 : 0);
+    sendEvent(5, radarCenter ? 1 : 0);
+    sendEvent(6, radarRight  ? 1 : 0);
   }
 }
